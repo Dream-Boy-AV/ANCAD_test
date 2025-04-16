@@ -1,62 +1,58 @@
 import argparse
+import chardet
 import os
-import re
 import sys
 from collections import defaultdict
+from unicodedata import category
 
 
 def get_text_files(directory):
     """Рекурсивно получаем все текстовые файлы в директории и поддиректориях."""
     text_files = []
-    try:
-        for root, _, files in os.walk(directory):
-            for file in files:
-                if file.endswith('.txt'):
-                    text_files.append(os.path.join(root, file))
-        if not text_files:
-            print(f"Предупреждение: в директории {directory} не найдено .txt файлов.")
-    except Exception as e:
-        print(f"Ошибка при поиске файлов: {e}", file=sys.stderr)
-        sys.exit(1)
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.txt'):
+                text_files.append(os.path.join(root, file))
+    if not text_files:
+        print(f"Предупреждение: в директории {directory} не найдено .txt файлов.")
     return text_files
 
 
 def count_chars_and_words(file_path):
     """Считаем символы и слова в файле, возвращаем статистику."""
+    # Определяем кодировку файла
     try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-    except UnicodeDecodeError:
-        try:
-            with open(file_path, 'r', encoding='cp1251') as file:
-                content = file.read()
-        except Exception as e:
-            print(f"Ошибка чтения файла {file_path}: {e}", file=sys.stderr)
-            return defaultdict(int), defaultdict(int), 0, 0
-    except PermissionError:
-        print(f"Нет доступа к файлу {file_path}", file=sys.stderr)
-        return defaultdict(int), defaultdict(int), 0, 0
-    except Exception as e:
-        print(f"Ошибка обработки файла {file_path}: {e}", file=sys.stderr)
-        return defaultdict(int), defaultdict(int), 0, 0
+        with open(file_path, 'rb') as f:
+            raw_data = f.read(10000)  # Читаем первые 10КБ для определения кодировки
+            encoding = chardet.detect(raw_data)['encoding']
 
-    # Считаем символы
+            if encoding is None:
+                encoding = 'utf-8'
+    except Exception as e:
+        raise AttributeError(f'Ошибка чтения файла {file_path}: {e}')
+
     char_counts = defaultdict(int)
-    for char in content:
-        char_counts[char] += 1
+    word_counts = defaultdict(int)
+    total_chars = 0
+    current_word = []
 
-    # Считаем слова (только буквы латиницы и кириллицы, игнорируя остальные символы)
-    try:
-        words = re.findall(r'\b[a-zA-Zа-яА-Я]+\b', content)
-        word_counts = defaultdict(int)
-        for word in words:
-            word_counts[word.lower()] += 1
-    except Exception as e:
-        print(f"Ошибка при обработке слов в файле {file_path}: {e}", file=sys.stderr)
-        word_counts = defaultdict(int)
-        words = []
+    with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+        for line in f:
+            for char in line:
+                total_chars += 1
+                char_counts[char] += 1
 
-    return char_counts, word_counts, len(content), len(words)
+                if category(char)[0] == 'L':
+                    current_word.append(char)
+                elif current_word:
+                    word_counts[''.join(current_word).casefold()] += 1
+                    current_word = []
+
+    if current_word:
+        word_counts[''.join(current_word).casefold()] += 1
+    total_words = sum(word_counts.values())
+
+    return char_counts, word_counts, total_chars, total_words
 
 
 def process_files(directory):
@@ -99,28 +95,33 @@ def get_most_common(items):
         most_common = most_common_list[0]
         return most_common
     except Exception as e:
-        print(f"Ошибка при определении наиболее частого элемента: {e}", file=sys.stderr)
-        return None, 0
+        raise AttributeError(f"Ошибка при определении наиболее частого элемента: {e}")
 
 
-def get_file_list_with_counts(file_stats, key, target):
+def get_file_list_with_counts(file_stats, count_key, target):
     """Создаем список файлов, содержащих целевой символ/слово с их статистикой."""
     file_list = []
-    if target is None:
-        return file_list
+
+    # Определяем соответствующий ключ для общего количества
+    total_key = {
+        'char_counts': 'total_chars',
+        'word_counts': 'total_words'
+    }.get(count_key)
+
+    if total_key is None:
+        raise ValueError(f"Неизвестный ключ счётчика: {count_key}. "
+                         f"Ожидается 'char_counts' или 'word_counts'")
 
     for file_path, stats in file_stats.items():
-        try:
-            count = stats[key].get(target, 0)
-            if count > 0:
-                file_list.append({
-                    'file_path': file_path,
-                    'total': stats[f'total_{key.split("_")[0]}s'],
-                    'count': count
-                })
-        except Exception as e:
-            print(f"Ошибка при обработке файла {file_path}: {e}", file=sys.stderr)
-            continue
+        counts_dict = stats.get(count_key, {})
+        count = counts_dict.get(target, 0) if target is not None else 0
+
+        if count > 0:
+            file_list.append({
+                'file_path': file_path,
+                'total': stats.get(total_key, 0),
+                'count': count
+            })
 
     return file_list
 
@@ -177,17 +178,26 @@ def print_results(most_common_char, char_files, most_common_word, word_files):
 def main():
     parser = argparse.ArgumentParser(description='Анализирует текстовые файлы на предмет самых частых символов и слов.')
     parser.add_argument('directory', help='Путь к директории с текстовыми файлами')
-    parser.add_argument('--sort', default='path',
-                        help='Критерий сортировки файлов (path, total, count, -path, -total, -count)')
+    parser.add_argument('--sort',
+                        default='path',
+                        choices=['path', '!path', 'total', '!total', 'count', '!count'],
+                        help='Критерий сортировки файлов (path, total, count, !path, !total, !count)')
+
     args = parser.parse_args()
 
     try:
         if not os.path.isdir(args.directory):
-            print(f"Ошибка: {args.directory} не является директорией.", file=sys.stderr)
-            sys.exit(1)
+            raise Exception(f"{args.directory} не является директорией.")
 
         total_char_counts, total_word_counts, file_stats = process_files(args.directory)
+    except AttributeError as ae:
+        print(ae)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Ошибка при поиске файлов: {e}", file=sys.stderr)
+        sys.exit(1)
 
+    try:
         if not file_stats:
             print("Нет данных для анализа. Возможно, в указанной директории нет .txt файлов.", file=sys.stderr)
             sys.exit(0)
@@ -203,6 +213,9 @@ def main():
         word_files_sorted = sort_file_list(word_files, args.sort)
 
         print_results(most_common_char, char_files_sorted, most_common_word, word_files_sorted)
+    except AttributeError as ae:
+        print(ae)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nРабота программы прервана пользователем.", file=sys.stderr)
         sys.exit(1)
